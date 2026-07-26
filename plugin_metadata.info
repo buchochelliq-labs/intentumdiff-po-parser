@@ -1,0 +1,13 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-06-11
+
+[language.po]
+language_name = PO/gettext
+language_short_name = PO
+monaco_language = plaintext
+default_filename = messages.po
+language_file_extensions = .po,.pot
