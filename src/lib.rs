@@ -23,6 +23,8 @@ struct ChildDraft {
     label: String,
     line: u32,
     col: u32,
+    end_line: u32,
+    end_col: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,10 +70,12 @@ fn parse_po(source: &str) -> String {
     let mut current = EntryDraft::default();
     let mut last_field_index: Option<usize> = None;
     let mut total_lines = 0u32;
+    let mut last_col = 0u32;
 
     for (index, raw) in source.lines().enumerate() {
         let line = index as u32;
         total_lines = line;
+        last_col = raw.len() as u32; // UTF-8 byte columns, not Unicode scalar counts.
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             flush_entry(&mut current, &mut entries);
@@ -84,6 +88,8 @@ fn parse_po(source: &str) -> String {
         } else {
             (false, trimmed)
         };
+        // The trimmed/obsolete statement is a slice of the original source line.
+        let statement_col = raw.find(statement).unwrap_or_default() as u32;
         if obsolete {
             current.obsolete = true;
         }
@@ -97,13 +103,13 @@ fn parse_po(source: &str) -> String {
             current.obsolete = obsolete;
         }
 
-        let comments = parse_comments(statement, line);
+        let comments = parse_comments(statement, line, statement_col);
         if !comments.is_empty() {
             current.children.extend(comments);
             last_field_index = None;
             continue;
         }
-        if let Some(child) = parse_message_field(statement, line) {
+        if let Some(child) = parse_message_field(statement, line, statement_col) {
             current.children.push(child);
             last_field_index = current.children.len().checked_sub(1);
             continue;
@@ -111,7 +117,13 @@ fn parse_po(source: &str) -> String {
         if statement.starts_with('"') {
             if let Some(field_index) = last_field_index {
                 let continuation = unquote(statement);
-                current.children[field_index].label.push_str(&continuation);
+                let child = &mut current.children[field_index];
+                child.label.push_str(&continuation);
+                // A continued PO string occupies additional source lines. Its
+                // displayed/decoded label length cannot stand in for byte spans.
+                let last_quote = statement.rfind('"').filter(|&end| end > 0).unwrap_or(statement.len());
+                child.end_line = line;
+                child.end_col = statement_col + last_quote as u32;
             }
         }
     }
@@ -124,7 +136,7 @@ fn parse_po(source: &str) -> String {
         0,
         0,
         total_lines,
-        0,
+        last_col,
         stable_hash(ROOT_NODE_TYPE, LANGUAGE_ID, &entries),
     )
     .children(entries)
@@ -171,16 +183,26 @@ fn entry_node(id: &str, draft: &EntryDraft) -> SemanticNode {
     } else {
         "message"
     };
-    node(id, node_type, &label, draft.line, 0, &children)
+    // The entry label omits PO syntax and can be shorter than the bytes edited
+    // in its children. Cover every original-source child, including msgstr.
+    let (end_line, end_col) = draft
+        .children
+        .iter()
+        .map(|child| (child.end_line, child.end_col))
+        .max()
+        .unwrap_or((draft.line, 0));
+    node_span(id, node_type, &label, draft.line, 0, end_line, end_col, &children)
 }
 
 fn child_node(id: &str, draft: &ChildDraft) -> SemanticNode {
-    node(
+    node_span(
         id,
         draft.node_type,
         &draft.label,
         draft.line,
         draft.col,
+        draft.end_line,
+        draft.end_col,
         &[],
     )
 }
@@ -205,53 +227,60 @@ fn first_label(children: &[SemanticNode], node_type: &str) -> Option<String> {
         .map(|child| child.label.clone())
 }
 
-fn parse_comments(statement: &str, line: u32) -> Vec<ChildDraft> {
+fn child_draft(
+    node_type: &'static str,
+    label: String,
+    line: u32,
+    col: u32,
+    end_col: u32,
+) -> ChildDraft {
+    ChildDraft { node_type, label, line, col, end_line: line, end_col }
+}
+
+fn parse_comments(statement: &str, line: u32, statement_col: u32) -> Vec<ChildDraft> {
     if let Some(rest) = statement.strip_prefix("#,") {
+        let mut consumed = 0usize;
         return rest
             .split(',')
-            .filter_map(|flag| {
-                let label = flag.trim();
-                (!label.is_empty()).then(|| ChildDraft {
-                    node_type: "flag",
-                    label: label.to_string(),
-                    line,
-                    col: 0,
-                })
+            .filter_map(|piece| {
+                let piece_offset = consumed;
+                consumed += piece.len() + 1;
+                let label = piece.trim();
+                if label.is_empty() { return None; }
+                let col = statement_col + 2 + (piece_offset + piece.find(label).unwrap_or_default()) as u32;
+                Some(child_draft("flag", label.to_string(), line, col, col + label.len() as u32))
             })
             .collect();
     }
     if let Some(rest) = statement.strip_prefix("#:") {
+        let mut cursor = 0usize;
         return rest
             .split_whitespace()
-            .map(|reference| ChildDraft {
-                node_type: "reference",
-                label: reference.to_string(),
-                line,
-                col: 0,
+            .map(|reference| {
+                let offset = cursor + rest[cursor..].find(reference).unwrap_or_default();
+                cursor = offset + reference.len();
+                let col = statement_col + 2 + offset as u32;
+                child_draft("reference", reference.to_string(), line, col, col + reference.len() as u32)
             })
             .collect();
     }
     let (node_type, rest) = if let Some(rest) = statement.strip_prefix("#.") {
         ("extracted_comment", rest)
-    } else if let Some(rest) = statement.strip_prefix("#") {
+    } else if let Some(rest) = statement.strip_prefix('#') {
         ("translator_comment", rest)
     } else {
         return Vec::new();
     };
-    let label = rest.trim().to_string();
+    let label = rest.trim();
     if label.is_empty() {
         Vec::new()
     } else {
-        vec![ChildDraft {
-            node_type,
-            label,
-            line,
-            col: 0,
-        }]
+        let col = statement_col + statement.find(label).unwrap_or_default() as u32;
+        vec![child_draft(node_type, label.to_string(), line, col, col + label.len() as u32)]
     }
 }
 
-fn parse_message_field(statement: &str, line: u32) -> Option<ChildDraft> {
+fn parse_message_field(statement: &str, line: u32, statement_col: u32) -> Option<ChildDraft> {
     for (prefix, node_type) in [
         ("msgctxt", "msgctxt"),
         ("msgid_plural", "msgid_plural"),
@@ -260,12 +289,17 @@ fn parse_message_field(statement: &str, line: u32) -> Option<ChildDraft> {
         ("msgstr", "msgstr"),
     ] {
         if statement.starts_with(prefix) {
-            return Some(ChildDraft {
-                node_type,
-                label: unquote(statement),
-                line,
-                col: statement.find('"').unwrap_or_default() as u32,
-            });
+            let (start, end) = if let Some(open) = statement.find('"') {
+                // The content, not its decoded label, is the original-source
+                // region. In particular, the closing quote is the half-open
+                // end even for escaped content or multibyte UTF-8 characters.
+                let end = statement.rfind('"').filter(|&close| close > open).unwrap_or(statement.len());
+                (open + 1, end)
+            } else {
+                (0, statement.len())
+            };
+            let col = statement_col + start as u32;
+            return Some(child_draft(node_type, unquote(statement), line, col, statement_col + end as u32));
         }
     }
     None
@@ -300,12 +334,14 @@ fn unquote(statement: &str) -> String {
     value
 }
 
-fn node(
+fn node_span(
     id: &str,
     node_type: &str,
     label: &str,
     line: u32,
     col: u32,
+    end_line: u32,
+    end_col: u32,
     children: &[SemanticNode],
 ) -> SemanticNode {
     SemanticNodeBuilder::new(
@@ -314,8 +350,8 @@ fn node(
         label,
         line,
         col,
-        line,
-        col + label.len() as u32,
+        end_line,
+        end_col,
         stable_hash(node_type, label, children),
     )
     .children(children.to_vec())
@@ -469,4 +505,54 @@ msgstr[1] "Save %s files"
         assert!(references.contains(&"src/ui.py:10".to_string()));
         assert!(references.contains(&"templates/base.html:2".to_string()));
     }
+    #[test]
+    fn source_spans_cover_last_edited_po_string_byte() {
+        let old: serde_json::Value =
+            serde_json::from_str(&parse_po("msgid \"greeting\"\n")).unwrap();
+        let new: serde_json::Value =
+            serde_json::from_str(&parse_po("msgid \"greetingX\"\n")).unwrap();
+        let old_message = &old["children"][0];
+        let new_message = &new["children"][0];
+        let new_id = &new_message["children"][0];
+        assert_eq!(old_message["position"]["end_col"], 15);
+        assert_eq!(new_message["position"]["start_col"], 0);
+        assert_eq!(new_message["position"]["end_col"], 16);
+        assert_eq!(new_id["position"]["start_col"], 7);
+        assert_eq!(new_id["position"]["end_col"], 16);
+        assert_eq!(new_id["label"], "greetingX");
+    }
+
+    #[test]
+    fn source_spans_use_utf8_bytes_and_preserve_indentation() {
+        let source = "  msgid \"hélloX\"\n  msgstr \"Hi\"\n";
+        let root: serde_json::Value = serde_json::from_str(&parse_po(source)).unwrap();
+        let message = &root["children"][0];
+        let id = &message["children"][0];
+        assert_eq!(id["label"], "hélloX");
+        assert_eq!(id["position"]["start_line"], 0);
+        assert_eq!(id["position"]["start_col"], 9);
+        assert_eq!(id["position"]["end_col"], 16);
+        assert_eq!(message["position"]["end_line"], 1);
+        assert_eq!(message["position"]["end_col"], 14);
+        assert_eq!(root["position"]["end_line"], 1);
+        assert_eq!(root["position"]["end_col"], 15);
+    }
+
+    #[test]
+    fn source_spans_follow_continuation_bytes_not_decoded_lengths() {
+        let source = "msgid \"\"\n\"héllo\"\nmsgstr \"\"\n\"Bon\\\\nX\"\n";
+        let root: serde_json::Value = serde_json::from_str(&parse_po(source)).unwrap();
+        let message = &root["children"][0];
+        let id = &message["children"][0];
+        let translation = &message["children"][1];
+        assert_eq!(id["label"], "héllo");
+        assert_eq!(id["position"]["start_line"], 0);
+        assert_eq!(id["position"]["end_line"], 1);
+        assert_eq!(id["position"]["end_col"], 7);
+        assert_eq!(translation["position"]["end_line"], 3);
+        assert_eq!(translation["position"]["end_col"], 7);
+        assert_eq!(message["position"]["end_line"], 3);
+        assert_eq!(message["position"]["end_col"], 7);
+    }
+
 }
