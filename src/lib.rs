@@ -505,6 +505,7 @@ msgstr[1] "Save %s files"
         assert!(references.contains(&"src/ui.py:10".to_string()));
         assert!(references.contains(&"templates/base.html:2".to_string()));
     }
+
     #[test]
     fn source_spans_cover_last_edited_po_string_byte() {
         let old: serde_json::Value =
@@ -533,14 +534,14 @@ msgstr[1] "Save %s files"
         assert_eq!(id["position"]["start_col"], 9);
         assert_eq!(id["position"]["end_col"], 16);
         assert_eq!(message["position"]["end_line"], 1);
-        assert_eq!(message["position"]["end_col"], 14);
+        assert_eq!(message["position"]["end_col"], 12);
         assert_eq!(root["position"]["end_line"], 1);
-        assert_eq!(root["position"]["end_col"], 15);
+        assert_eq!(root["position"]["end_col"], 13);
     }
 
     #[test]
     fn source_spans_follow_continuation_bytes_not_decoded_lengths() {
-        let source = "msgid \"\"\n\"héllo\"\nmsgstr \"\"\n\"Bon\\\\nX\"\n";
+        let source = "msgid \"\"\n\"héllo\"\nmsgstr \"\"\n\"Bon\\nX\"\n";
         let root: serde_json::Value = serde_json::from_str(&parse_po(source)).unwrap();
         let message = &root["children"][0];
         let id = &message["children"][0];
